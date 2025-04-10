@@ -18,6 +18,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
         return {"status": "ignored"}
 
     payload = await request.json()
+    print(payload)
     action = payload.get("action")
     if action not in ["opened", "reopened", "ready_for_review", "synchronize"]:
         return {"status": "ignored"}
