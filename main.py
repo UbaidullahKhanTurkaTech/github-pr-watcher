@@ -18,7 +18,6 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
         return {"status": "ignored"}
 
     payload = await request.json()
-    print(payload)
     action = payload.get("action")
     if action not in ["opened", "reopened", "ready_for_review", "synchronize"]:
         return {"status": "ignored"}
@@ -34,6 +33,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
     workflow_url = f"https://github.com/{repo_name}/pull/{payload['number']}"
 
     team_leads = repo_team_map.get(repo_name, [])
+    print("Team lead = ", team_leads)
     if not team_leads:
         return {"status": "no_team_leads"}
 
@@ -49,7 +49,10 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
     # Format Slack message
     mention_block = " ".join(slack_ids)
     channel = os.getenv("SLACK_CHANNEL", "#github-pr-review-notification")
-
+    
+    print("Slack ID = ", mention_block)
+    print("Channel = ", channel)
+    
     message = {
         "channel": channel,
         "text": "🚨 New Pull Request Notification",
