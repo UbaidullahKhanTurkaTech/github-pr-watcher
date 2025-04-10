@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from fastapi import FastAPI, Request, Header
 from dotenv import load_dotenv
 from utils import get_slack_id_by_email, send_slack_message
@@ -23,26 +24,22 @@ async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
         "Accept": "application/vnd.github+json"
     }
 
-    for attempt in range(5):  # Try 5 times (2 seconds apart)
-        async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient() as client:
+        for attempt in range(3):
             response = await client.get(url, headers=headers)
 
-        if response.status_code != 200:
-            print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
-            return "❓ Merge status fetch failed"
+            if response.status_code != 200:
+                print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
+                return "❓ Merge status fetch failed"
 
-        data = response.json()
-        mergeable = data.get("mergeable")
+            data = response.json()
+            mergeable = data.get("mergeable")
 
-        if mergeable is not None:
-            if mergeable is True:
-                return "✅ Mergeable"
-            elif mergeable is False:
-                return "❌ Has conflicts"
+            if mergeable is not None:
+                return "✅ Mergeable" if mergeable else "❌ Has conflicts"
 
-        # GitHub is still computing mergeability
-        print(f"[INFO] mergeable is null, retrying... ({attempt + 1}/5)")
-        await asyncio.sleep(2)
+            print(f"[INFO] mergeable is null, retrying... ({attempt + 1}/3)")
+            await asyncio.sleep(1)
 
     return "⏳ Merge status still unknown"
 
@@ -68,7 +65,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
     workflow_url = f"https://github.com/{repo_name}/pull/{pr_number}"
 
     team_leads = repo_team_map.get(repo_name, [])
-    print("Team lead = ", team_leads)
+    print("[INFO] Team lead emails:", team_leads)
     if not team_leads:
         return {"status": "no_team_leads"}
 
@@ -79,6 +76,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
             slack_ids.append(f"<@{slack_id}>")
 
     if not slack_ids:
+        print("[WARN] No Slack user IDs resolved")
         return {"status": "no_valid_slack_ids"}
 
     # 🔍 Get mergeable status from GitHub
@@ -88,8 +86,8 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
     mention_block = " ".join(slack_ids)
     channel = os.getenv("SLACK_CHANNEL", "#github-pr-review-notification")
 
-    print("Slack ID = ", mention_block)
-    print("Channel = ", channel)
+    print("[INFO] Slack mentions:", mention_block)
+    print("[INFO] Sending message to channel:", channel)
 
     message = {
         "channel": channel,
