@@ -60,16 +60,16 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Event:*\n`{action}`"},
-                    {"type": "mrkdwn", "text": f"*Ref:*\n`refs/pull/{payload['number']}/merge`"},
-                    {"type": "mrkdwn", "text": f"*Commit:*\n<{workflow_url}|`{short_commit}`>"}
+                    {"type": "mrkdwn", "text": f"*Event:* `pull_request = {action}`"},
+                    {"type": "mrkdwn", "text": f"*Ref:* `refs/pull/{payload['number']}/merge`"},
+                    {"type": "mrkdwn", "text": f"*Commit:* <{workflow_url}|`{short_commit}`>"}
                 ]
             },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f":rotating_light: *New PR* opened by `{pr_author}`:\n<{pr_url}|{pr_title}>\n\n:twisted_rightwards_arrows: *Branch:* `{pr_head}` → `{pr_base}`\n:bust_in_silhouette: *Team Lead(s):*\n{mention_block}"
+                    "text": f":rotating_light: *New PR* opened by `{pr_author}`:\n<{pr_url}|{pr_title}>\n\n:twisted_rightwards_arrows: *Branch:* `{pr_head}` → `{pr_base}`\n:bust_in_silhouette: *Team Lead(s):* {mention_block}"
                 }
             }
         ]
