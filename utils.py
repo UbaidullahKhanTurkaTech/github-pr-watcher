@@ -4,6 +4,8 @@ import httpx
 SLACK_API_URL = "https://slack.com/api"
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_PR_REVIEW_TOKEN")
 
+print("SLACK_BOT_TOKEN = ", SLACK_BOT_TOKEN)
+
 async def get_slack_id_by_email(email: str) -> str | None:
     headers = {
         "Authorization": f"Bearer {SLACK_BOT_TOKEN}"
