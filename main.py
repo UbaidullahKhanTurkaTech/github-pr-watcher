@@ -133,3 +133,7 @@ async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
             await asyncio.sleep(1)
 
     return "⏳ Merge status still unknown"
+
+@app.get("/health", tags=["Health Check"])
+async def health_check():
+    return {"status": "ok", "service": "GitHub PR Watcher"}
