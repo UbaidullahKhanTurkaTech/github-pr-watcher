@@ -5,11 +5,10 @@
 import os
 import json
 import asyncio
-from fastapi import FastAPI, Request, Header
+import httpx
+from fastapi import FastAPI, Request, Header, BackgroundTasks
 from dotenv import load_dotenv
 from utils import get_slack_id_by_email, send_slack_message
-import httpx
-import asyncio
 
 load_dotenv()
 
@@ -49,7 +48,7 @@ async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
     return "⏳ Merge status still unknown"
 
 @app.post("/webhook")
-async def github_webhook(request: Request, x_github_event: str = Header(None)):
+async def github_webhook(request: Request, background_tasks: BackgroundTasks, x_github_event: str = Header(None)):
     if x_github_event != "pull_request":
         return {"status": "ignored"}
 
@@ -58,6 +57,11 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
     if action not in ["opened", "reopened", "ready_for_review", "synchronize"]:
         return {"status": "ignored"}
 
+    # Respond fast, process in background
+    background_tasks.add_task(handle_pr_event, payload)
+    return {"status": "accepted"}
+
+async def handle_pr_event(payload: dict):
     repo_name = payload["repository"]["full_name"]
     pr_number = payload["number"]
     pr_url = payload["pull_request"]["html_url"]
@@ -72,7 +76,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
     team_leads = repo_team_map.get(repo_name, [])
     print("[INFO] Team lead emails:", team_leads)
     if not team_leads:
-        return {"status": "no_team_leads"}
+        return
 
     slack_ids = []
     for email in team_leads:
@@ -82,7 +86,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
 
     if not slack_ids:
         print("[WARN] No Slack user IDs resolved")
-        return {"status": "no_valid_slack_ids"}
+        return
 
     # 🔍 Get mergeable status from GitHub
     merge_status = await fetch_mergeable_state(repo_name, pr_number)
@@ -101,7 +105,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Event:* `pull_request = {action}`"},
+                    {"type": "mrkdwn", "text": f"*Event:* `pull_request = {payload['action']}`"},
                     {"type": "mrkdwn", "text": f"*Ref:* `refs/pull/{pr_number}/merge`"},
                     {"type": "mrkdwn", "text": f"*Commit:* <{workflow_url}|`{short_commit}`>"},
                     {"type": "mrkdwn", "text": f"*Mergeable:* {merge_status}"}
