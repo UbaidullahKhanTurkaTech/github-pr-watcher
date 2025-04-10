@@ -6,7 +6,7 @@ import os
 import json
 import asyncio
 import httpx
-from fastapi import FastAPI, Request, Header, BackgroundTasks
+from fastapi import FastAPI, Request, Header
 from dotenv import load_dotenv
 from utils import get_slack_id_by_email, send_slack_message
 
@@ -20,46 +20,29 @@ with open("repo_team_map.json", "r") as f:
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
-    """Poll GitHub API until the PR's mergeable state is resolved."""
-    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
-
-    async with httpx.AsyncClient() as client:
-        for attempt in range(3):
-            response = await client.get(url, headers=headers)
-
-            if response.status_code != 200:
-                print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
-                return "❓ Merge status fetch failed"
-
-            data = response.json()
-            mergeable = data.get("mergeable")
-
-            if mergeable is not None:
-                return "✅ Mergeable" if mergeable else "❌ Has conflicts"
-
-            print(f"[INFO] mergeable is null, retrying... ({attempt + 1}/3)")
-            await asyncio.sleep(1)
-
-    return "⏳ Merge status still unknown"
-
+# 📌 Respond immediately, then parse and process in background
 @app.post("/webhook")
-async def github_webhook(request: Request, background_tasks: BackgroundTasks, x_github_event: str = Header(None)):
-    if x_github_event != "pull_request":
-        return {"status": "ignored"}
+async def github_webhook(request: Request, x_github_event: str = Header(None)):
+    raw_body = await request.body()
+    asyncio.create_task(handle_webhook(raw_body, x_github_event))
+    return {"status": "accepted"}  # Respond immediately to avoid GitHub timeout
 
-    payload = await request.json()
-    action = payload.get("action")
-    if action not in ["opened", "reopened", "ready_for_review", "synchronize"]:
-        return {"status": "ignored"}
 
-    # Respond fast, process in background
-    background_tasks.add_task(handle_pr_event, payload)
-    return {"status": "accepted"}
+async def handle_webhook(raw_body: bytes, event_type: str):
+    try:
+        if event_type != "pull_request":
+            return
+
+        payload = json.loads(raw_body)
+        action = payload.get("action")
+        if action not in ["opened", "reopened", "ready_for_review", "synchronize"]:
+            return
+
+        await handle_pr_event(payload)
+
+    except Exception as e:
+        print(f"[ERROR] Failed to process webhook: {e}")
+
 
 async def handle_pr_event(payload: dict):
     repo_name = payload["repository"]["full_name"]
@@ -122,4 +105,31 @@ async def handle_pr_event(payload: dict):
     }
 
     await send_slack_message(message)
-    return {"status": "notified"}
+
+
+async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
+    """Poll GitHub API until the PR's mergeable state is resolved."""
+    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        for attempt in range(3):
+            response = await client.get(url, headers=headers)
+
+            if response.status_code != 200:
+                print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
+                return "❓ Merge status fetch failed"
+
+            data = response.json()
+            mergeable = data.get("mergeable")
+
+            if mergeable is not None:
+                return "✅ Mergeable" if mergeable else "❌ Has conflicts"
+
+            print(f"[INFO] mergeable is null, retrying... ({attempt + 1}/3)")
+            await asyncio.sleep(1)
+
+    return "⏳ Merge status still unknown"
