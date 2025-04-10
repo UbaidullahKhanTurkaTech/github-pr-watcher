@@ -16,27 +16,35 @@ with open("repo_team_map.json", "r") as f:
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
-    """Call GitHub API to check if the PR is mergeable."""
+    """Poll GitHub API until the PR's mergeable state is resolved."""
     url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json"
     }
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            mergeable = data.get("mergeable")
+    for attempt in range(5):  # Try 5 times (2 seconds apart)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+
+        if response.status_code != 200:
+            print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
+            return "❓ Merge status fetch failed"
+
+        data = response.json()
+        mergeable = data.get("mergeable")
+
+        if mergeable is not None:
             if mergeable is True:
                 return "✅ Mergeable"
             elif mergeable is False:
                 return "❌ Has conflicts"
-            else:
-                return "⏳ Merge status unknown"
-        else:
-            print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
-            return "❓ Merge status fetch failed"
+
+        # GitHub is still computing mergeability
+        print(f"[INFO] mergeable is null, retrying... ({attempt + 1}/5)")
+        await asyncio.sleep(2)
+
+    return "⏳ Merge status still unknown"
 
 @app.post("/webhook")
 async def github_webhook(request: Request, x_github_event: str = Header(None)):
