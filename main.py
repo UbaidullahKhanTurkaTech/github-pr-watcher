@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request, Header
 from dotenv import load_dotenv
 from utils import get_slack_id_by_email, send_slack_message
 import httpx
+import asyncio
 
 load_dotenv()
 
