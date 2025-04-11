@@ -35,8 +35,8 @@ async def handle_webhook(raw_body: bytes, event_type: str):
 
         payload = json.loads(raw_body)
         action = payload.get("action")
-        if action not in ["opened", "reopened", "ready_for_review", "synchronize"]:
-            return
+        # if action not in ["opened", "reopened", "ready_for_review", "synchronize"]:
+        #     return
 
         await handle_pr_event(payload)
 
