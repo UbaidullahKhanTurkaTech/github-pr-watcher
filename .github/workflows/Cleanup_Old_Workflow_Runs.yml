@@ -5,6 +5,10 @@ on:
     - cron: '0 0 * * *'  # Every day at midnight UTC
   workflow_dispatch:     # Optional: allow manual trigger
 
+permissions:
+  actions: write
+  contents: read
+  
 jobs:
   delete-workflows:
     runs-on: ubuntu-latest
