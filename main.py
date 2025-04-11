@@ -56,29 +56,31 @@ async def handle_pr_event(payload: dict):
     short_commit = commit_sha[:7]
     workflow_url = f"https://github.com/{repo_name}/pull/{pr_number}"
 
+    # Team leads (if any)
     team_leads = repo_team_map.get(repo_name, [])
-    print("[INFO] Team lead emails:", team_leads)
-    if not team_leads:
-        return
-
-    slack_ids = []
+    team_lead_mentions = []
     for email in team_leads:
         slack_id = await get_slack_id_by_email(email)
         if slack_id:
-            slack_ids.append(f"<@{slack_id}>")
+            team_lead_mentions.append(f"<@{slack_id}>")
 
-    if not slack_ids:
-        print("[WARN] No Slack user IDs resolved")
-        return
+    # 🧠 Get PR author's email from commit history
+    author_email = await get_email_from_pr_commits(repo_name, pr_number)
+    author_slack_mention = f"`{pr_author}`"  # fallback
+    if author_email:
+        slack_id = await get_slack_id_by_email(author_email)
+        if slack_id:
+            author_slack_mention = f"<@{slack_id}>"
+            print(f"[INFO] PR author Slack ID: {slack_id}")
+        else:
+            print(f"[WARN] Could not resolve Slack ID for PR author email: {author_email}")
+    else:
+        print(f"[WARN] Could not extract email for PR author {pr_author}")
 
     # 🔍 Get mergeable status from GitHub
     merge_status = await fetch_mergeable_state(repo_name, pr_number)
 
-    # Format Slack message
-    mention_block = " ".join(slack_ids)
     channel = os.getenv("SLACK_CHANNEL", "#github-pr-review-notification")
-
-    print("[INFO] Slack mentions:", mention_block)
     print("[INFO] Sending message to channel:", channel)
 
     message = {
@@ -98,7 +100,12 @@ async def handle_pr_event(payload: dict):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f":rotating_light: *New PR* opened by `{pr_author}`:\n<{pr_url}|{pr_title}>\n\n:twisted_rightwards_arrows: *Branch:* `{pr_head}` → `{pr_base}`\n:bust_in_silhouette: *Team Lead(s):* {mention_block}"
+                    "text": (
+                        f":rotating_light: *New PR* opened by {author_slack_mention}:\n"
+                        f"<{pr_url}|{pr_title}>\n\n"
+                        f":twisted_rightwards_arrows: *Branch:* `{pr_head}` → `{pr_base}`\n"
+                        f":bust_in_silhouette: *Team Lead(s):* {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'}"
+                    )
                 }
             }
         ]
@@ -133,6 +140,32 @@ async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
             await asyncio.sleep(1)
 
     return "⏳ Merge status still unknown"
+
+
+async def get_email_from_pr_commits(repo_name: str, pr_number: int) -> str | None:
+    """Extracts email from commits in the PR (only if email is not hidden)."""
+    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/commits"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+        if response.status_code != 200:
+            print(f"[ERROR] Could not fetch commits for PR #{pr_number}")
+            return None
+
+        commits = response.json()
+        for commit in commits:
+            author = commit.get("commit", {}).get("author", {})
+            email = author.get("email")
+            if email and "noreply" not in email:
+                print(f"[INFO] Found email from commit: {email}")
+                return email
+
+    return None
+
 
 @app.get("/health", tags=["Health Check"])
 async def health_check():
