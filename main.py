@@ -194,8 +194,8 @@ async def handle_pr_event(payload: dict):
 
             status_map["closed"] = f"`{'Closed Merged PR' if merged else 'Closed PR without merge'}`"
             Message_in_Body = (
-                f"This PR was *{merge_method_status if merged else 'closed without merge'}* by {closer_slack_mention}.\n"
-                f"<{pr_url}|PR>"
+                f"This <{pr_url}|PR> was *{merge_method_status if merged else 'closed without merge'}* by {closer_slack_mention}.\n"
+                f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} Kindly review the <{pr_url}|PR>closed.\n"
             )
 
         # Logic for edited PR
