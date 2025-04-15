@@ -1,3 +1,4 @@
+
 #########################################################################################
 # Author: Ubaidullah Khan
 # License: 2025 - ?
@@ -21,60 +22,97 @@ load_dotenv()
 app = FastAPI()
 
 PR_Actions = [
-                "assigned",
-                "auto_merge_disabled",
-                "auto_merge_enabled",
-                "closed",
-                "converted_to_draft",
-                "demilestoned",
-                "dequeued",
-                "edited",
-                "enqueued",
-                "labeled",
-                "locked",
-                "milestoned",
-                "opened",
-                "ready_for_review",
-                "reopened",
-                "review_request_removed",
-                "review_requested",
-                "synchronize",
-                "unassigned",
-                "unlabeled",
-                "unlocked"
-            ]
+    "assigned", "auto_merge_disabled", "auto_merge_enabled", "closed", "converted_to_draft",
+    "demilestoned", "dequeued", "edited", "enqueued", "labeled", "locked", "milestoned",
+    "opened", "ready_for_review", "reopened", "review_request_removed", "review_requested",
+    "synchronize", "unassigned", "unlabeled", "unlocked"
+]
 
-# Load repository to team lead email mapping
+# Load mapping files
 with open("repo_team_map.json", "r") as f:
     repo_team_map = json.load(f)
+
+with open("user_map_emails.json", "r") as f:
+    user_map_emails = json.load(f)
+
+def resolve_email_from_username(username: str) -> str | None:
+    return user_map_emails.get(username)
+
+async def resolve_slack_mention(username: str) -> str:
+    email = resolve_email_from_username(username)
+    if email:
+        slack_id = await get_slack_id_by_email(email)
+        if slack_id:
+            return f"<@{slack_id}>"
+    return f"`{username}`"
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AUTHOR_EMAIL = os.getenv("AUTHOR_EMAIL")
 
-# 📌 Respond immediately, then parse and process in background
+@app.get("/health", tags=["Health Check"])
+async def health_check():
+    return {"status": "ok", "service": "GitHub PR Watcher"}
+    
 @app.post("/webhook")
 async def github_webhook(request: Request, x_github_event: str = Header(None)):
     raw_body = await request.body()
     asyncio.create_task(handle_webhook(raw_body, x_github_event))
-    return {"status": "accepted"}  # Respond immediately to avoid GitHub timeout
-
+    return {"status": "accepted"}
 
 async def handle_webhook(raw_body: bytes, event_type: str):
     try:
         if event_type != "pull_request":
             return
-
         payload = json.loads(raw_body)
         action = payload.get("action")
         if action not in PR_Actions:
             return
-
+        # with open("payload.json", "w", encoding="utf-8") as f:
+            # json.dump(payload, f, indent=4, ensure_ascii=False)
         await handle_pr_event(payload)
-
     except Exception as e:
         print(f"[ERROR] Failed to process webhook: ", e)
         traceback.print_exc()
 
+async def get_email_of_merger(repo_name: str, pr_number: int) -> tuple[str | None, str | None]:
+    pr_api_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    async with httpx.AsyncClient() as client:
+        pr_resp = await client.get(pr_api_url, headers=headers)
+        if pr_resp.status_code != 200:
+            return None, None
+        pr_data = pr_resp.json()
+        merge_commit_sha = pr_data.get("merge_commit_sha")
+        if not merge_commit_sha:
+            return None, None
+        commit_url = f"https://api.github.com/repos/{repo_name}/commits/{merge_commit_sha}"
+        commit_resp = await client.get(commit_url, headers=headers)
+        if commit_resp.status_code != 200:
+            return None, None
+        commit_data = commit_resp.json()
+        email = commit_data.get("commit", {}).get("author", {}).get("email")
+        login = commit_data.get("author", {}).get("login")
+        return email, login
+
+async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
+    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+    async with httpx.AsyncClient() as client:
+        for attempt in range(3):
+            response = await client.get(url, headers=headers)
+            if response.status_code != 200:
+                print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
+                return "❓ Merge status fetch failed"
+            data = response.json()
+            mergeable = data.get("mergeable")
+            if mergeable is not None:
+                return "✅" if mergeable else "❌ `Has conflicts`"
+            print(f"[INFO] mergeable is null, retrying... ({attempt + 1}/3)")
+            await asyncio.sleep(1)
+    return "⏳ Merge status still unknown"
 
 async def handle_pr_event(payload: dict):
     repo_name = payload["repository"]["full_name"]
@@ -87,7 +125,10 @@ async def handle_pr_event(payload: dict):
     commit_sha = payload["pull_request"]["head"]["sha"]
     short_commit = commit_sha[:7]
     workflow_url = f"https://github.com/{repo_name}/pull/{pr_number}"
-
+    
+    PR_AUTHOR = payload["pull_request"]["user"]["login"]  # the one who originally opened the PR action username
+    PR_ACTOR = payload["sender"]["login"]  # the one who performed the
+    
     # Team leads (if any)
     team_leads = repo_team_map.get(repo_name, [])
     team_lead_mentions = []
@@ -95,24 +136,15 @@ async def handle_pr_event(payload: dict):
         slack_id = await get_slack_id_by_email(email)
         if slack_id:
             team_lead_mentions.append(f"<@{slack_id}>")
-
+    
+    team_lead_mentions = ' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'
+    
     # 🧠 Get PR author's email from commit history
-    author_email = await get_email_from_pr_commits(repo_name, pr_number)
-    author_slack_mention = f"`{pr_author}`"  # fallback
-    if author_email:
-        slack_id = await get_slack_id_by_email(author_email)
-        if slack_id:
-            author_slack_mention = f"<@{slack_id}>"
-            print(f"[INFO] PR author Slack ID: {slack_id}")
-        else:
-            print(f"[WARN] Could not resolve Slack ID for PR author email: {author_email}")
-    else:
-        print(f"[WARN] Could not extract email for PR author {pr_author}")
+    PR_AUTHOR_SLACK = await resolve_slack_mention(PR_AUTHOR)
+    PR_ACTOR_SLACK = await resolve_slack_mention(PR_ACTOR)
 
     # 🔍 Get mergeable status from GitHub
     merge_status = await fetch_mergeable_state(repo_name, pr_number)
-    
-    
     
     Message_in_Body = ""
             
@@ -135,7 +167,7 @@ async def handle_pr_event(payload: dict):
             "opened": "*New PR* opened",
             "reopened": "PR was *reopened*",
             "synchronize": "*New PR* updated",
-            "closed": "PR was *closed*",
+            "closed": "PR was *opened*",
             "edited": "PR was *edited*",
             "converted_to_draft": "PR was *converted to draft*"
         }
@@ -149,21 +181,11 @@ async def handle_pr_event(payload: dict):
             "converted_to_draft": "`Draft Mode Enabled`"
         }
 
-        # Get who performed the action
-        actor = payload["sender"]["login"]
-        actor_email = await get_email_from_pr_commits(repo_name, pr_number)
-        actor_mention = f"`{actor}`"
-        if actor_email:
-            slack_id = await get_slack_id_by_email(actor_email)
-            if slack_id:
-                actor_mention = f"<@{slack_id}>"
-
-        action_actor_mention = actor_mention
-
         # Logic for closed PR
         if action == "closed":
+            # Determine who closed/merged the PR
+            # Get merger's email from the merge commit
             merged = payload['pull_request'].get("merged", False)
-            closer_slack_mention = action_actor_mention
             merge_method_status = "Not Merged"
 
             if merged:
@@ -194,8 +216,8 @@ async def handle_pr_event(payload: dict):
 
             status_map["closed"] = f"`{'Closed Merged PR' if merged else 'Closed PR without merge'}`"
             Message_in_Body = (
-                f"This <{pr_url}|PR> was *{merge_method_status if merged else 'closed without merge'}* by {closer_slack_mention}.\n"
-                f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} Kindly review the <{pr_url}|PR> closed.\n"
+                f"This <{pr_url}|PR> was *{merge_method_status if merged else 'closed without merge'}* by {PR_ACTOR_SLACK}.\n"
+                f"`[TL]` {team_lead_mentions} Kindly review the <{pr_url}|PR> closed.\n"
             )
 
         # Logic for edited PR
@@ -213,43 +235,38 @@ async def handle_pr_event(payload: dict):
 
             if merge_status == "✅":
                 Message_in_Body = (
-                    f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'}, "
-                    f"please review this <{pr_url}|PR> now after edits."
+                    f"`[TL]` {team_lead_mentions}, Please review this <{pr_url}|PR> now after edits by {PR_ACTOR_SLACK}."
                 )
             elif merge_status == "❌ `Has conflicts`":
                 Message_in_Body = (
-                    f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} "
-                    f"Please ask `[Developer]` {action_actor_mention} to resolve this <{pr_url}| PR>."
+                    f"`[TL]` {team_lead_mentions}, Please ask `[Developer]` {PR_ACTOR_SLACK} / {PR_AUTHOR_SLACK} to resolve this <{pr_url}| PR>."
                 )
             else:
                 Message_in_Body = (
-                    f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} "
-                    f"PR has been edited by {action_actor_mention}. Please review <{pr_url}|PR>."
+                    f"`[TL]` {team_lead_mentions}, PR has been edited by {PR_ACTOR_SLACK}. Please review <{pr_url}|PR>."
                 )
 
         # Logic for converted_to_draft PR
         elif action == "converted_to_draft":
             Message_in_Body = (
-                f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} "
-                f"This PR has been converted to *Draft* mode.\n<{pr_url}|PR>"
+                f"`[TL]` {team_lead_mentions}, This <{pr_url}|PR> has been converted to *Draft* mode.\n"
             )
 
         # Default logic for opened / reopened / synchronize
         elif action in ["opened", "reopened", "synchronize"]:
             if merge_status == "✅":
                 Message_in_Body = (
-                    f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} "
-                    f"Kindly review this <{pr_url}| PR>{' recently edited by the author.' if action == 'synchronize' else ''}"
+                    f"`[TL]` {team_lead_mentions} "
+                    f"Kindly review this <{pr_url}| PR>{f' recently edited by the {PR_ACTOR_SLACK}.' if action == 'synchronize' else ''}"
                 )
             elif merge_status == "❌ `Has conflicts`":
                 Message_in_Body = (
-                    f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} "
-                    f"Please ask `[Developer]` {action_actor_mention} to resolve this <{pr_url}| PR>."
+                    f"`[TL]` {team_lead_mentions} "
+                    f"Please ask `[Developer]` {PR_ACTOR_SLACK} to resolve this <{pr_url}| PR>."
                 )
             else:
                 Message_in_Body = (
-                    f"`[TL]` {' '.join(team_lead_mentions) if team_lead_mentions else 'N/A'} "
-                    f"Please review this <{pr_url}| PR>."
+                    f"`[TL]` {team_lead_mentions} Please review this <{pr_url}| PR>."
                 )
 
         # Final Slack message structure
@@ -262,7 +279,7 @@ async def handle_pr_event(payload: dict):
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"{emoji_map[action]} {header_map[action]} by {action_actor_mention}:\n"
+                            f"{emoji_map[action]} {header_map[action]} by {PR_AUTHOR_SLACK}:\n"
                             f":twisted_rightwards_arrows: *Branch:* `{pr_head}` → `{pr_base}`\n"
                             f"Current Status: {status_map[action]}"
                         )
@@ -293,28 +310,10 @@ async def handle_pr_event(payload: dict):
         lock_text = "locked" if lock_action == "locked" else "unlocked"
         lock_title = "PR Locked" if lock_action == "locked" else "PR Unlocked"
 
-        # PR author mention
-        pr_author = payload["pull_request"]["user"]["login"]
-        author_email = await get_email_from_pr_commits(repo_name, pr_number)
-        author_slack_mention = f"`{pr_author}`"
-        if author_email:
-            slack_id = await get_slack_id_by_email(author_email)
-            if slack_id:
-                author_slack_mention = f"<@{slack_id}>"
-
-        # Action performer (who locked/unlocked)
-        actor = payload["sender"]["login"]
-        actor_email = await get_email_from_pr_commits(repo_name, pr_number)  # fallback
-        actor_mention = f"`{actor}`"
-        if actor_email:
-            slack_id = await get_slack_id_by_email(actor_email)
-            if slack_id:
-                actor_mention = f"<@{slack_id}>"
-
         Message_in_Body = (
             f"{lock_emoji} {lock_title}\n"
-            f"`[TL]` {' '.join(team_lead_mentions)} This <{pr_url}|PR> by {author_slack_mention} "
-            f"has been `{lock_text}` by {actor_mention}."
+            f"`[TL]` {team_lead_mentions} This <{pr_url}|PR> by opened by {PR_AUTHOR_SLACK} "
+            f"has been `{lock_text}` by {PR_ACTOR_SLACK}."
         )
 
         message = {
@@ -349,14 +348,6 @@ async def handle_pr_event(payload: dict):
                 added = label_event_buffer[repo_pr_key]["labeled"]
                 removed = label_event_buffer[repo_pr_key]["unlabeled"]
 
-                actor = payload["sender"]["login"]
-                actor_email = await get_email_from_pr_commits(repo_name, pr_number)
-                actor_mention = f"`{actor}`"
-                if actor_email:
-                    slack_id = await get_slack_id_by_email(actor_email)
-                    if slack_id:
-                        actor_mention = f"<@{slack_id}>"
-
                 added_str = ", ".join(sorted(added)) if added else ""
                 removed_str = ", ".join(sorted(removed)) if removed else ""
 
@@ -378,7 +369,7 @@ async def handle_pr_event(payload: dict):
                                 "type": "mrkdwn",
                                 "text": (
                                     f"🏷️ Labels Updated on PR.\n"
-                                    f"`[TL]` {' '.join(team_lead_mentions)} Labels {summary} on this <{pr_url}|PR> by {actor_mention}.\n"
+                                    f"`[TL]` {team_lead_mentions} Labels {summary} on this <{pr_url}|PR> by {PR_ACTOR_SLACK}.\n"
                                 )
                             }
                         }
@@ -393,16 +384,6 @@ async def handle_pr_event(payload: dict):
 
     elif payload['action'] in ["auto_merge_enabled", "auto_merge_disabled"]:
         action = payload['action']
-        actor = payload["sender"]["login"]
-
-        # Mention formatting
-        actor_email = await get_email_from_pr_commits(repo_name, pr_number)
-        actor_mention = f"`{actor}`"
-        if actor_email:
-            slack_id = await get_slack_id_by_email(actor_email)
-            if slack_id:
-                actor_mention = f"<@{slack_id}>"
-
         # Dynamic values
         title = "✅ Auto-Merge Enabled" if action == "auto_merge_enabled" else "🚫 Auto-Merge Disabled"
         icon = ":white_check_mark:" if action == "auto_merge_enabled" else ":no_entry_sign:"
@@ -417,9 +398,9 @@ async def handle_pr_event(payload: dict):
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"{icon} Auto-merge was {verb} by {actor_mention} on this PR.\n"
+                            f"{icon} Auto-merge was {verb} by {PR_ACTOR_SLACK} on this PR.\n"
                             f":twisted_rightwards_arrows: *Branch:* `{pr_head}` → `{pr_base}`\n"
-                            f"<{pr_url}|PR>"
+                            f"`[TL]` {team_lead_mentions} Please have a look at this <{pr_url}|PR>."
                         )
                     }
                 }
@@ -471,7 +452,6 @@ async def handle_pr_event(payload: dict):
                 }
             ]
         }
-
         await send_slack_message(message)
         
     elif payload['action'] in ["milestoned", "demilestoned"]:
@@ -505,24 +485,10 @@ async def handle_pr_event(payload: dict):
                 f"Removed Milestone: `{milestone_title}`\n"
             )
 
-        # Get the user who added or removed the milestone
-        user = payload["sender"].get("login", "unknown user")
-        user_email = payload["sender"]["login"]
-        # Fetch the Slack ID for the user who actioned the PR
-        slack_id = await get_slack_id_by_email(user_email)
-
-        if slack_id:
-            actioned_by_message = f"<@{slack_id}>"
-        else:
-            actioned_by_message = f"{user}"
-
-        # Format the team lead mentions (TL) in the message
-        TL_Info = ' '.join([f"{tl}" for tl in team_lead_mentions])  # Assuming `team_lead_mentions` is defined elsewhere
-
         # Append action details
         Message_in_Body += (
-            f"Actioned by: {actioned_by_message}\n"
-            f"`[TL]` {TL_Info} {additional_message}. Kindly check the <{pr_url}|PR> here.\n"
+            f"Actioned by: {PR_ACTOR_SLACK}\n"
+            f"`[TL]` {team_lead_mentions} {additional_message}. Kindly check the <{pr_url}|PR> here.\n"
         )
         
         # Prepare the message
@@ -541,7 +507,7 @@ async def handle_pr_event(payload: dict):
         await send_slack_message(message)
     
     elif payload['action'] == "dequeued":
-        Message_in_Body = f"`[TL]` {' '.join(team_lead_mentions)} This PR was dequeued from a merge queue.\n<{pr_url}|PR>"
+        Message_in_Body = f"This PR was dequeued from a merge queue by {PR_ACTOR_SLACK}.\n `[TL]` {team_lead_mentions}, Kindly have a look at this <{pr_url}|PR>."
         message = {
             "channel": channel,
             "text": "⏳ PR Dequeued",
@@ -554,7 +520,7 @@ async def handle_pr_event(payload: dict):
     elif payload['action'] == "enqueued":
         Message_in_Body = (
                             f"📥 PR Enqueued\n"
-                            f"`[TL]` {' '.join(team_lead_mentions)} This PR was added to a merge queue.\n<{pr_url}|PR>"
+                            f"This PR was added to a merge queue By {PR_ACTOR_SLACK}.\n `[TL]` {team_lead_mentions} Kindly check this <{pr_url}|PR>."
                         )
         message = {
             "channel": channel,
@@ -568,7 +534,7 @@ async def handle_pr_event(payload: dict):
     elif payload['action'] == "ready_for_review":
         Message_in_Body = (
                             f"✅ PR Ready for Review\n"
-                            f"`[TL]` {' '.join(team_lead_mentions)} This draft PR is now *ready for review*.\n<{pr_url}|PR>"
+                            f"`[TL]` {team_lead_mentions} This draft <{pr_url}|PR> is now *ready for review*.\n"
                         )
         message = {
             "channel": channel,
@@ -580,11 +546,21 @@ async def handle_pr_event(payload: dict):
         await send_slack_message(message)
         
     elif payload['action'] == "review_requested":
-        reviewers = payload.get("requested_reviewers", [])
-        requested_mentions = ", ".join(f"`{r['login']}`" for r in reviewers)
+        reviewers = payload["pull_request"].get("requested_reviewers", [])
+    
+        # 🔁 Resolve GitHub usernames to Slack mentions using your helper
+        requested_mentions = []
+        for reviewer in reviewers:
+            github_username = reviewer["login"]
+            mention = await resolve_slack_mention(github_username)
+            requested_mentions.append(mention)
+
+        requested_mentions_str = ", ".join(requested_mentions) if requested_mentions else "`Reviewer Not Found`"
+
+        print(requested_mentions)
         Message_in_Body = (
                             f"🧐 Review Requested\n"
-                            f"`[TL]` {' '.join(team_lead_mentions)} Review has been requested from {requested_mentions}.\n<{pr_url}|PR>"
+                            f"`[TL]` {team_lead_mentions} Review has been requested for this <{pr_url}|PR> from {requested_mentions_str} by {PR_ACTOR_SLACK}.\n"
                         )
         message = {
             "channel": channel,
@@ -596,11 +572,11 @@ async def handle_pr_event(payload: dict):
         await send_slack_message(message)
         
     elif payload['action'] == "review_request_removed":
-        reviewers = payload.get("requested_reviewers", [])
-        removed_mentions = ", ".join(f"`{r['login']}`" for r in reviewers)
+        reviewers = payload.get("requested_reviewer", [])
+        removed_mentions = await resolve_slack_mention(reviewers['login'])
         Message_in_Body = (
                             f"🚫 Review Request Removed\n"
-                            f"`[TL]` {' '.join(team_lead_mentions)} Review request was removed for {removed_mentions}.\n<{pr_url}|PR>"
+                            f"`[TL]` {team_lead_mentions} Review request was removed for <{pr_url}|PR>. Member Removed:  {removed_mentions} by {PR_ACTOR_SLACK}.\n"
                         )
         message = {
             "channel": channel,
@@ -639,62 +615,3 @@ async def handle_pr_event(payload: dict):
         }
         
         await send_slack_message(message)
-    
-
-
-async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
-    """Poll GitHub API until the PR's mergeable state is resolved."""
-    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
-
-    async with httpx.AsyncClient() as client:
-        for attempt in range(3):
-            response = await client.get(url, headers=headers)
-
-            if response.status_code != 200:
-                print(f"[ERROR] GitHub API error: {response.status_code} - {response.text}")
-                return "❓ Merge status fetch failed"
-
-            data = response.json()
-            mergeable = data.get("mergeable")
-
-            if mergeable is not None:
-                return "✅" if mergeable else "❌ `Has conflicts`"
-
-            print(f"[INFO] mergeable is null, retrying... ({attempt + 1}/3)")
-            await asyncio.sleep(1)
-
-    return "⏳ Merge status still unknown"
-
-
-async def get_email_from_pr_commits(repo_name: str, pr_number: int) -> str | None:
-    """Extracts email from commits in the PR (only if email is not hidden)."""
-    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/commits"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
-
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code != 200:
-            print(f"[ERROR] Could not fetch commits for PR #{pr_number}")
-            return None
-
-        commits = response.json()
-        for commit in commits:
-            author = commit.get("commit", {}).get("author", {})
-            email = author.get("email")
-            if email and "noreply" not in email:
-                print(f"[INFO] Found email from commit: {email}")
-                return email
-
-    return None
-
-
-@app.get("/health", tags=["Health Check"])
-async def health_check():
-    return {"status": "ok", "service": "GitHub PR Watcher"}
