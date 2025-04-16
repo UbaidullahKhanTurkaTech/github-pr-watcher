@@ -13,6 +13,7 @@ from utils import get_slack_id_by_email, send_slack_message
 import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
+import requests
 
 # Temporary in-memory storage for debounce
 label_event_buffer = defaultdict(lambda: {"labeled": set(), "unlabeled": set(), "last_updated": datetime.utcnow()})
@@ -28,12 +29,39 @@ PR_Actions = [
     "synchronize", "unassigned", "unlabeled", "unlocked"
 ]
 
-# Load mapping files
-with open("repo_team_map.json", "r") as f:
-    repo_team_map = json.load(f)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+AUTHOR_EMAIL = os.getenv("AUTHOR_EMAIL")
 
-with open("user_map_emails.json", "r") as f:
-    user_map_emails = json.load(f)
+GITHUB_API_URL = os.getenv("CONTENT_URL")
+GITHUB_HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3.raw"
+}
+
+def fetch_config_file(filename):
+    url = GITHUB_API_URL + filename
+    try:
+        response = requests.get(url, headers=GITHUB_HEADERS)
+        response.raise_for_status()
+        return json.loads(response.text)
+    except Exception as e:
+        print(f"Failed to fetch {filename}: {e}")
+        return {}
+
+# def get_repo_team_map():
+    # return fetch_config_file("repo_team_map.json")
+
+# def get_user_map_emails():
+    # return fetch_config_file("user_map_emails.json")
+# Load mapping files
+# with open("repo_team_map.json", "r") as f:
+    # repo_team_map = json.load(f)
+
+# with open("user_map_emails.json", "r") as f:
+    # user_map_emails = json.load(f)
+
+repo_team_map = fetch_config_file("repo_team_map.json")
+user_map_emails = fetch_config_file("user_map_emails.json")
 
 def resolve_email_from_username(username: str) -> str | None:
     return user_map_emails.get(username)
@@ -45,9 +73,6 @@ async def resolve_slack_mention(username: str) -> str:
         if slack_id:
             return f"<@{slack_id}>"
     return f"`{username}`"
-
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-AUTHOR_EMAIL = os.getenv("AUTHOR_EMAIL")
 
 @app.get("/health", tags=["Health Check"])
 async def health_check():
@@ -167,7 +192,7 @@ async def handle_pr_event(payload: dict):
             "opened": "*New PR* opened",
             "reopened": "PR was *reopened*",
             "synchronize": "*New PR* updated",
-            "closed": "PR was *opened*",
+            "closed": "PR is *closed*",
             "edited": "PR was *edited*",
             "converted_to_draft": "PR was *converted to draft*"
         }
@@ -215,10 +240,11 @@ async def handle_pr_event(payload: dict):
                         merge_method_status = "Merged"
 
             status_map["closed"] = f"`{'Closed Merged PR' if merged else 'Closed PR without merge'}`"
-            Message_in_Body = (
-                f"This <{pr_url}|PR> was *{merge_method_status if merged else 'closed without merge'}* by {PR_ACTOR_SLACK}.\n"
-                f"`[TL]` {team_lead_mentions} Kindly review the <{pr_url}|PR> closed.\n"
-            )
+            Message_in_Body = ""
+            # (
+                # f"This <{pr_url}|PR> was *{merge_method_status if merged else 'closed without merge'}* by {PR_ACTOR_SLACK}.\n"
+                # #f"`[TL]` {team_lead_mentions} Kindly review the <{pr_url}|PR> closed.\n"
+            # )
 
         # Logic for edited PR
         elif action == "edited":
@@ -268,18 +294,20 @@ async def handle_pr_event(payload: dict):
                 Message_in_Body = (
                     f"`[TL]` {team_lead_mentions} Please review this <{pr_url}| PR>."
                 )
+        fields = [
+            {"type": "mrkdwn", "text": f"*Commit:* <{workflow_url}|`{short_commit}`>"}
+        ]
 
-        # Final Slack message structure
-        message = {
-            "channel": channel,
-            "text": f"{emoji_map[action]} Pull Request Notification",
-            "blocks": [
+        if action != "closed":
+            fields.append({"type": "mrkdwn", "text": f"*Mergeable:* {merge_status}"})
+        
+        blocks = [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"{emoji_map[action]} {header_map[action]} by {PR_AUTHOR_SLACK}:\n"
+                            f"{emoji_map[action]} {header_map[action]} by {PR_AUTHOR_SLACK if action != 'closed' else PR_ACTOR_SLACK}:\n"
                             f":twisted_rightwards_arrows: *Branch:* `{pr_head}` → `{pr_base}`\n"
                             f"Current Status: {status_map[action]}"
                         )
@@ -287,19 +315,23 @@ async def handle_pr_event(payload: dict):
                 },
                 {
                     "type": "section",
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*Commit:* <{workflow_url}|`{short_commit}`>"},
-                        {"type": "mrkdwn", "text": f"*Mergeable:* `{merge_method_status}`" if action == "closed" else f"*Mergeable:* {merge_status}"}
-                    ]
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": Message_in_Body
-                    }
+                    "fields": fields
                 }
-            ]
+        ]
+
+        if Message_in_Body.strip():  # only add if not empty or just whitespace
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": Message_in_Body
+                }
+            })
+        # Final Slack message structure
+        message = {
+            "channel": channel,
+            "text": f"{emoji_map[action]} Pull Request Notification",
+            "blocks": blocks
         }
 
         await send_slack_message(message)
