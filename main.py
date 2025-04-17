@@ -13,6 +13,7 @@ from utils import get_slack_id_by_email, send_slack_message
 import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
+from zoho_update import update_status_with_task_key
 import requests
 
 # Temporary in-memory storage for debounce
@@ -83,22 +84,7 @@ async def github_webhook(request: Request, x_github_event: str = Header(None)):
     raw_body = await request.body()
     asyncio.create_task(handle_webhook(raw_body, x_github_event))
     return {"status": "accepted"}
-
-async def handle_webhook(raw_body: bytes, event_type: str):
-    try:
-        if event_type != "pull_request":
-            return
-        payload = json.loads(raw_body)
-        action = payload.get("action")
-        if action not in PR_Actions:
-            return
-        # with open("payload.json", "w", encoding="utf-8") as f:
-            # json.dump(payload, f, indent=4, ensure_ascii=False)
-        await handle_pr_event(payload)
-    except Exception as e:
-        print(f"[ERROR] Failed to process webhook: ", e)
-        traceback.print_exc()
-
+    
 async def get_email_of_merger(repo_name: str, pr_number: int) -> tuple[str | None, str | None]:
     pr_api_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
@@ -139,6 +125,26 @@ async def fetch_mergeable_state(repo_name: str, pr_number: int) -> str:
             await asyncio.sleep(1)
     return "⏳ Merge status still unknown"
 
+async def handle_webhook(raw_body: bytes, event_type: str):
+    try:
+        # with open("payload.json", "w", encoding="utf-8") as f:
+            # json.dump(json.loads(raw_body), f, indent=4, ensure_ascii=False)
+        payload = json.loads(raw_body)
+        if event_type == "pull_request":
+            action = payload.get("action")
+            # if action not in PR_Actions:
+                # return
+            await handle_pr_event(payload)
+        elif event_type == "pull_request_review":
+            await handle_pull_request_review(payload)
+    except Exception as e:
+        print(f"[ERROR] Failed to process webhook: ", e)
+        traceback.print_exc()
+
+async def handle_pull_request_review(payload: dict):
+    if payload["action"] == "submitted" and payload["review"]["state"] == "changes_requested":
+        print(update_status_with_task_key(payload["pull_request"]["head"]["ref"], "Changes Requested", f''))
+    return
 async def handle_pr_event(payload: dict):
     repo_name = payload["repository"]["full_name"]
     pr_number = payload["number"]
@@ -334,7 +340,11 @@ async def handle_pr_event(payload: dict):
             "blocks": blocks
         }
 
-        await send_slack_message(message)
+        await send_slack_message(message) # Sample ID = HI1-T406
+        if action == "opened":
+            print(update_status_with_task_key(pr_head, "Ready For Review", f'')) #New <a href="{pr_url}">PR</a> opened. Please review it.
+        elif action == "closed" and merged:
+            print(update_status_with_task_key(pr_head, "PR Merge", f''))
         
     elif payload['action'] in ["locked", "unlocked"]:
         lock_action = payload['action']  # "locked" or "unlocked"
