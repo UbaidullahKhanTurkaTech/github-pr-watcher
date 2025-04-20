@@ -3,6 +3,10 @@
 # Author: Ubaidullah Khan
 # License: 2025 - ?
 #########################################################################################
+import traceback
+from collections import defaultdict
+from datetime import datetime, timedelta
+import requests
 import os
 import json
 import asyncio
@@ -10,11 +14,7 @@ import httpx
 from fastapi import FastAPI, Request, Header
 from dotenv import load_dotenv
 from utils import get_slack_id_by_email, send_slack_message
-import traceback
-from collections import defaultdict
-from datetime import datetime, timedelta
-from zoho_update import update_status_with_task_key
-import requests
+from zoho_update import update_status_with_task_key, Read_For_QA
 
 # Temporary in-memory storage for debounce
 label_event_buffer = defaultdict(lambda: {"labeled": set(), "unlabeled": set(), "last_updated": datetime.utcnow()})
@@ -38,6 +38,25 @@ GITHUB_HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
     "Accept": "application/vnd.github.v3.raw"
 }
+
+QA_Channel = os.getenv("SLACK_CHANNEL_READY_FOR_QA")
+async def notify_qa_members():
+    QA_mentions_local = [] 
+    member_emails = os.getenv("MEMBER_NOTIFY_QA")
+    for email in json.loads(member_emails):
+        slack_id = await get_slack_id_by_email(email.strip())
+        if slack_id:
+            QA_mentions_local.append(f"<@{slack_id}>")
+
+    QA_mentions_local = ' '.join(QA_mentions_local) if QA_mentions_local else 'N/A'
+    return QA_mentions_local
+
+QA_mentions = ""
+
+@app.on_event("startup")
+async def startup_event():
+    app.state.QA_mentions = await notify_qa_members()
+    print("QA_mentions =", app.state.QA_mentions)
 
 def fetch_config_file(filename):
     url = GITHUB_API_URL + filename
@@ -131,11 +150,13 @@ async def handle_webhook(raw_body: bytes, event_type: str):
             # json.dump(json.loads(raw_body), f, indent=4, ensure_ascii=False)
         payload = json.loads(raw_body)
         if event_type == "pull_request":
+            print("Pull Request event Performed.")
             action = payload.get("action")
             # if action not in PR_Actions:
                 # return
             await handle_pr_event(payload)
         elif event_type == "pull_request_review":
+            print("Pull Request Review is Performed.")
             await handle_pull_request_review(payload)
     except Exception as e:
         print(f"[ERROR] Failed to process webhook: ", e)
@@ -175,11 +196,13 @@ async def handle_pr_event(payload: dict):
     PR_ACTOR_SLACK = await resolve_slack_mention(PR_ACTOR)
 
     # 🔍 Get mergeable status from GitHub
-    merge_status = await fetch_mergeable_state(repo_name, pr_number)
+    merge_status = ""
+    if payload['action'] != "closed":
+        merge_status = await fetch_mergeable_state(repo_name, pr_number)
     
     Message_in_Body = ""
             
-    channel = os.getenv("SLACK_CHANNEL", "#github-pr-review-notification")
+    channel = os.getenv("SLACK_CHANNEL")
     
     if payload['action'] in ["opened", "reopened", "synchronize", "closed", "edited", "converted_to_draft"]:
         action = payload['action']
@@ -341,11 +364,26 @@ async def handle_pr_event(payload: dict):
         }
 
         await send_slack_message(message) # Sample ID = HI1-T406
+        
         if action == "opened":
             print(update_status_with_task_key(pr_head, "Ready For Review", f'')) #New <a href="{pr_url}">PR</a> opened. Please review it.
         elif action == "closed" and merged:
             print(update_status_with_task_key(pr_head, "PR Merge", f''))
-        
+            DATA = Read_For_QA(pr_head, repo_name, 2)
+            
+            if DATA != None:
+                message_lines = [f"{app.state.QA_mentions}\n*Kindly check these task(s) Ready For QA:*"]
+                for i, (key, task) in enumerate(DATA.items(), 1):
+                    task_link = task.get("link", "#")
+                    message_lines.append(f"{i}) <{task_link}|{key}>")
+                
+                final_message = "\n".join(message_lines)
+                message = {
+                            "channel": QA_Channel,
+                            "text": final_message,
+                          }
+                await send_slack_message(message)
+
     elif payload['action'] in ["locked", "unlocked"]:
         lock_action = payload['action']  # "locked" or "unlocked"
         lock_emoji = ":lock:" if lock_action == "locked" else ":unlock:"
@@ -657,3 +695,4 @@ async def handle_pr_event(payload: dict):
         }
         
         await send_slack_message(message)
+    
