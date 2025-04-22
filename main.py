@@ -369,7 +369,7 @@ async def handle_pr_event(payload: dict):
             print(update_status_with_task_key(pr_head, "Ready For Review", f'')) #New <a href="{pr_url}">PR</a> opened. Please review it.
         elif action == "closed" and merged:
             print(update_status_with_task_key(pr_head, "PR Merge", f''))
-            DATA = Read_For_QA(pr_head, repo_name, 2)
+            DATA = Read_For_QA(pr_head, repo_name, 7)
             
             if DATA != None:
                 message_lines = [f"{app.state.QA_mentions}\n*Kindly check these task(s) Ready For QA:*"]
