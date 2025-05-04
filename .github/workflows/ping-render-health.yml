@@ -1,8 +1,8 @@
 name: Keep Render App Awake
 
 on:
-  schedule:
-    - cron: "*/3 * * * *"  # every 10 minutes (UTC)
+  #schedule:
+    #- cron: "*/3 * * * *"  # every 10 minutes (UTC)
   workflow_dispatch:        # optional manual trigger from GitHub UI
 
 jobs:
